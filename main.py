@@ -1,4 +1,3 @@
-
 import re
 import numpy as np
 import faiss
@@ -8,91 +7,110 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_ollama import OllamaLLM
 
 
-def pdf_to_chunks(pdf_path):
+def split_text_into_chunks(text, max_length=500):
+    paragraphs = re.split(r'(?<=\.)\s*\n', text)
+    chunks = []
+    current_chunk = []
+    current_length = 0
 
-    reader = PdfReader(pdf_path)
-    text = reader.pages
-    all_chunks = []
-    for page in text:
-        text_of_page = page.extract_text()
-        if text_of_page:
-            if not re.search(r'[.!?]', text_of_page):
-                all_chunks.append(text_of_page)
-            sentences = re.split(r'(?<=[.!?])\s+', text_of_page)
-            chunks = []
-            current_chunk = ""
-            for i in sentences:
-                if len(current_chunk) + len(i) > 500:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = i
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
+        paragraph_length = len(paragraph)
+        if paragraph_length > max_length:
+            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                sentence_length = len(sentence)
+
+                if current_length + sentence_length > max_length:
+                    if current_chunk:
+                        chunks.append(" ".join(current_chunk))
+                    current_chunk = [sentence]
+                    current_length = sentence_length
                 else:
-                    current_chunk += " " + i
-            all_chunks.extend(chunks)
-    return all_chunks
+                    current_chunk.append(sentence)
+                    current_length += sentence_length
+        else:
+            if current_length + paragraph_length > max_length:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                current_chunk = [paragraph]
+                current_length = paragraph_length
+            else:
+                current_chunk.append(paragraph)
+                current_length += paragraph_length
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
 
 
-def csv_to_chunks(csv_path):
+def extract_text_from_pdf(pdf_path, max_length=500):
+    reader = PdfReader(pdf_path)
+    full_text = ""
+    for page_num in range(len(reader.pages)):
+        page = reader.pages[page_num]
+        page_text = page.extract_text()
+
+        if page_text.strip():
+            page_text += ' '
+
+        full_text += page_text
+
+
+    return split_text_into_chunks(full_text, max_length)
+
+
+
+def extract_text_from_csv(csv_path):
     df = pd.read_csv(csv_path)
     prefixes = ["Услуга", "Условие", "Тариф"]
-
-    all_chunks = df.apply(lambda row: " | ".join(
-        [f"{prefixes[i]}: {str(row[col])}" for i, col in enumerate(df.columns) if pd.notna(row[col])],
+    csv_chunks = df.apply(lambda row: " | ".join(
+        [f"{prefixes[i]}: {str(row[col])}" for i, col in enumerate(df.columns) if pd.notna(row[col])]
     ), axis=1).tolist()
-
-    return all_chunks
+    return csv_chunks
 
 
 def process_and_search(file_paths, query):
-
     all_chunks = []
-
 
     for file_path in file_paths:
         if file_path.endswith('.pdf'):
-            chunks_pdf = pdf_to_chunks(file_path)
-            all_chunks.extend(chunks_pdf)
+            all_chunks.extend(extract_text_from_pdf(file_path))
         elif file_path.endswith('.csv'):
-            chunks_csv = csv_to_chunks(file_path)
-            all_chunks.extend(chunks_csv)
+            all_chunks.extend(extract_text_from_csv(file_path))
         else:
             print(f"Формат файла {file_path} не поддерживается.")
 
-
-    embedding_model = OllamaEmbeddings(model="mxbai-embed-large")
-    embeddings = embedding_model.embed_documents(all_chunks)
-    embeddings = np.array(embeddings)
+    embedding_model = OllamaEmbeddings(model="bge-m3")
+    embeddings = np.array(embedding_model.embed_documents(all_chunks))
 
     index = faiss.IndexFlatL2(embeddings.shape[1])
-    for i in range(0, len(embeddings), 100):
-        index.add(embeddings[i:i + 100])
+    index.add(embeddings)
 
-
-    query_embedding = embedding_model.embed_query(query)
-    query_embedding = np.array(query_embedding)
+    query_embedding = np.array(embedding_model.embed_query(query))
     k = 10
     indexes = index.search(query_embedding.reshape(1, -1), k)[1][0]
 
-    context = []
-    for i in indexes:
-        context.append(all_chunks[i])
-
-    context = [text.replace("\n", " ") for text in context]
-    context = [text.replace("\xa0", " ") for text in context]
-
-    return context
+    return [all_chunks[i] for i in indexes]
 
 
 def get_response_from_model(query, context):
     input_text = f"Вот контекст из документа, выбери из него подходящую информацию для вопроса пользователя и отвечай по контексту. Если в контексте нет информации близкой к вопросу, просто дословно напиши 'Я не знаю'. Контекст:\n\n{context}\n\nВопрос пользователя: {query}"
     llm = OllamaLLM(model="llama3.1")
-    response = llm.invoke(input_text)
-    return response
+    return llm.invoke(input_text)
 
 
 def main(file_paths, query):
-
     context = process_and_search(file_paths, query)
+    context = [text.replace("\n", " ") for text in context]
+    context = [text.replace("\xa0", " ") for text in context]
     print("Контекст:", context)
-
     response = get_response_from_model(query, context)
     print("Ответ модели:", response)
